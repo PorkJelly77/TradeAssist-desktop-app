@@ -26,64 +26,87 @@
 
   // In-memory cache — stays synced with what the app sees
   let _cache = null;
+  let _pendingWrite = null;
+  let _writeTimer = null;
 
-  // Patch localStorage so the app's sync calls work with a memory cache,
-  // while we persist to file asynchronously
-  function _patchLocalStorage() {
-    // Save original methods
-    const _origSet = Storage.prototype.setItem;
-    const _origGet = Storage.prototype.getItem;
-    const _origRemove = Storage.prototype.removeItem;
-
-    // We only wrap setItem/getItem/removeItem for our specific key
-    Storage.prototype.getItem = function(key) {
-      if (key === STORAGE_KEY) {
-        if (_cache !== null) return _cache;
-        // Fall through to original on first call before file load
-        return _origGet.call(this, key);
+  // Debounced file write: coalesces rapid setItem calls
+  function _scheduleWrite(value) {
+    _pendingWrite = value;
+    if (_writeTimer) clearTimeout(_writeTimer);
+    _writeTimer = setTimeout(() => {
+      _writeTimer = null;
+      if (_pendingWrite !== null) {
+        _writeFile(_pendingWrite);
+        _pendingWrite = null;
       }
-      return _origGet.call(this, key);
-    };
-
-    Storage.prototype.setItem = function(key, value) {
-      if (key === STORAGE_KEY) {
-        _cache = String(value);
-        _origSet.call(this, key, value);
-        if (_ready) _writeFile(value);
-        return;
-      }
-      _origSet.call(this, key, value);
-    };
-
-    Storage.prototype.removeItem = function(key) {
-      if (key === STORAGE_KEY) {
-        _cache = null;
-        _ready = false;
-      }
-      _origRemove.call(this, key);
-    };
+    }, 300);
   }
 
-  // Initialize: load from file and populate localStorage
+  // Patch localStorage BEFORE any scripts run
+  // We do NOT wait for DOMContentLoaded — app.js calls load() immediately
+  const _origSetItem = Storage.prototype.setItem;
+  const _origGetItem = Storage.prototype.getItem;
+  const _origRemoveItem = Storage.prototype.removeItem;
+  const _origClear = Storage.prototype.clear;
+
+  Storage.prototype.getItem = function(key) {
+    if (key === STORAGE_KEY) {
+      if (_cache !== null) {
+        return _cache;
+      }
+    }
+    return _origGetItem.call(this, key);
+  };
+
+  Storage.prototype.setItem = function(key, value) {
+    _origSetItem.call(this, key, value);
+    if (key === STORAGE_KEY) {
+      _cache = String(value);
+      if (_ready) _scheduleWrite(value);
+    }
+  };
+
+  Storage.prototype.removeItem = function(key) {
+    _origRemoveItem.call(this, key);
+    if (key === STORAGE_KEY) {
+      _cache = null;
+    }
+  };
+
+  Storage.prototype.clear = function() {
+    _origClear.call(this);
+    _cache = null;
+  };
+
+  // Initialize: load from file, populate cache and real localStorage
   (async function init() {
     const fileData = await _readFile();
     if (fileData) {
       _cache = fileData;
-      // Hydrate the real localStorage so the app's load() works
-      window.localStorage.setItem(STORAGE_KEY, fileData);
+      // Seed the real localStorage so the app's load() finds data
+      _origSetItem.call(window.localStorage, STORAGE_KEY, fileData);
     }
     _ready = true;
+
+    // If the app already loaded its state (scripts already ran),
+    // save whatever is in localStorage now so we don't lose it
+    const current = _origGetItem.call(window.localStorage, STORAGE_KEY);
+    if (current && current !== fileData) {
+      _cache = current;
+      _scheduleWrite(current);
+    }
   })();
 
-  // Patch localStorage after all scripts load, so the app's vars exist
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', _patchLocalStorage);
-  } else {
-    _patchLocalStorage();
-  }
-
-  // Save on unload
+  // Extra safety: save on page unload (no debounce — fire immediately)
   window.addEventListener('beforeunload', () => {
+    if (_writeTimer) clearTimeout(_writeTimer);
     if (_cache !== null) _writeFile(_cache);
   });
+
+  // Also save periodically every 10 seconds while there's pending data
+  setInterval(() => {
+    if (_cache !== null) {
+      _writeFile(_cache);
+    }
+  }, 10000);
 })();
